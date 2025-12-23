@@ -256,13 +256,16 @@ HTML = """<!doctype html>
 <body>
   <div class="header">
     <div class="top">
+<div class="title">Records For Sale</div>
+
       
     <div class="intro">
+      <p><b>Collection focus:</b> This catalog focuses on classical, jazz, folk/world, country, and vocal pop records — <b>not a rock-heavy collection</b>.</p>
+      <p class="small">Most titles date from the <b>1950s–1980s</b> and represent traditional pressings rather than new releases.</p>
       <p><b>How to use:</b> Browse, filter, and search. Click <b>Add</b> to put records in your cart, then open <b>Cart</b> to review.</p>
       <p class="muted small">Condition is assumed to be generally good unless noted, but grading can vary—please message me if you want details before buying.</p>
     </div>
-<div class="title">Records For Sale</div>
-      <button id="cartOpen" class="btn cartbtn">Cart (0)</button>
+<button id="cartOpen" class="btn cartbtn">Cart (0)</button>
     </div>
     <div class="sub">Search + filter. Status/condition may be uninspected unless noted.</div>
 
