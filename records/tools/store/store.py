@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# BUILD_ID: 20251222_STORE_V11
+# BUILD_ID: 20260113_STORE_V12
 
 from __future__ import annotations
 
@@ -67,7 +67,7 @@ def _choose_year(years: List[Optional[int]]) -> Optional[int]:
 
 
 def load_pricing_overrides(path: Path) -> Dict[str, dict]:
-    """
+    r"""
     pricing_overrides.csv lives in D:\records\data\store\pricing_overrides.csv (persistent).
     Keyed by normalized artist||title.
     """
@@ -196,8 +196,7 @@ HTML = """<!doctype html>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Record Store</title>
   <style>
-    :root { --header-h: 118px; }
-    body { font-family: Arial, sans-serif; margin: 0; background: #fff; color: #111; }
+    html, body { margin: 0; padding: 0; height: 100%; } body { font-family: Arial, sans-serif; background: #fff; color: #111; display: flex; flex-direction: column; }
     .header { position: sticky; top: 0; z-index: 50; background: #fff; border-bottom: 1px solid #e6e6e6; padding: 12px 14px; }
     .top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
     .title { font-size: 20px; font-weight: 800; margin-right: 8px; }
@@ -208,7 +207,7 @@ HTML = """<!doctype html>
     .btn { border: 1px solid #d6d6d6; background: #fff; padding: 8px 10px; border-radius: 10px; cursor: pointer; }
     .btn:disabled { opacity: .45; cursor: not-allowed; }
     .cartbtn { margin-left: auto; white-space: nowrap; }
-    .content { height: calc(100vh - var(--header-h)); overflow: auto; padding: 14px; }
+    .content { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 14px; }
     .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
     .card { border: 1px solid #eee; border-radius: 14px; padding: 12px; display: flex; gap: 12px; }
     .cover { width: 88px; height: 88px; border-radius: 10px; object-fit: cover; background: #f5f5f5; flex: 0 0 auto; }
@@ -255,26 +254,13 @@ HTML = """<!doctype html>
 </head>
 <body>
   <div class="header">
-    <div class="top">
-<div class="title">Records For Sale</div>
-
-      
-    <div class="intro">
-      <p><b>Collection focus:</b> This catalog focuses on classical, jazz, folk/world, country, and vocal pop records — <b>not a rock-heavy collection</b>.</p>
-      <p class="small">Most titles date from the <b>1950s–1980s</b> and represent traditional pressings rather than new releases.</p>
-      <p><b>How to use:</b> Browse, filter, and search. Click <b>Add</b> to put records in your cart, then open <b>Cart</b> to review.</p>
-      <p class="muted small">Condition is assumed to be generally good unless noted, but grading can vary—please message me if you want details before buying.</p>
-    </div>
-<button id="cartOpen" class="btn cartbtn">Cart (0)</button>
-    </div>
-    <div class="sub">Search + filter. Status/condition may be uninspected unless noted.</div>
-
     <div class="controls">
+      <button id="helpOpen" class="btn">Help / About</button>
+      <button id="cartOpen" class="btn cartbtn">Cart (0)</button>
       <input id="q" placeholder="Search artist or title..." />
       <select id="artist"><option value="">All artists</option></select>
       <select id="genre"><option value="">All genres</option></select>
       <select id="decade"><option value="">All decades</option></select>
-      <label class="small"><input type="checkbox" id="hidePending" checked /> Hide pending/sold</label>
       <button id="clear" class="btn">Clear</button>
     </div>
   </div>
@@ -397,8 +383,9 @@ function updateCartButton(){
     return "";
   }
 
+  const HIDE_PENDING = true;
   function isHiddenByStatus(it){
-    const hide = $("hidePending").checked;
+    const hide = HIDE_PENDING;
     if(!hide) return false;
     const s = (it.status||"available").toLowerCase();
     return (s==="pending" || s==="sold");
@@ -551,7 +538,6 @@ $("modal").classList.add("open");
     $("artist").addEventListener("change", ()=>applyFilters());
     $("genre").addEventListener("change", ()=>applyFilters());
     $("decade").addEventListener("change", ()=>applyFilters());
-    $("hidePending").addEventListener("change", ()=>applyFilters());
     $("clear").addEventListener("click", ()=>{
       $("q").value="";
       $("artist").value="";
@@ -597,6 +583,33 @@ $("modal").classList.add("open");
   boot();
 })();
 </script>
+
+<div id="helpModal" class="modal" aria-hidden="true" style="display:none">
+  <div class="modalbox">
+    <div class="modalhead">
+      <h2>About This Catalog</h2>
+      <button id="helpClose" class="btn close">Close</button>
+    </div>
+    <div class="modal-body small" style="overflow-y:auto;max-height:70vh;">
+      <p><b>Collection focus:</b> Classic pop, jazz, easy listening, and vocal LPs.</p>
+      <p><b>How to use:</b> Browse, use search and filters, then tap <b>Add to Cart</b> on anything you’re interested in.</p>
+      <p>The cart builds a simple text list you can <b>copy/paste into a Facebook Marketplace message</b> when you’re ready to reach out.</p>
+      <p>Status/condition may be uninspected unless noted. <b>Damaged records will be discounted.</b></p>
+      <p>Feel free to message for detailed grading or questions — happy to help.</p>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  const hm = document.getElementById("helpModal");
+  const open = document.getElementById("helpOpen");
+  const close = document.getElementById("helpClose");
+  if(open){ open.onclick = ()=>{ hm.style.display='flex'; hm.classList.add('open'); hm.setAttribute('aria-hidden','false'); }; }
+  if(close){ close.onclick = ()=>{ hm.style.display='none'; hm.classList.remove('open'); hm.setAttribute('aria-hidden','true'); }; }
+})();
+</script>
+
 </body>
 </html>
 """

@@ -1,0 +1,166 @@
+Working notes for ChatGPT when collaborating with David on the records codebase.
+
+Paste this file into a fresh chat so I (ChatGPT) load the correct assumptions
+and development rules. Treat it as my “offline memory”.
+
+-----------------------------------------------------------------------------
+0. Big picture
+-----------------------------------------------------------------------------
+- Repo (source code only, no secrets):
+    C:\Users\David\Documents\GitHub\code\records\
+
+- Runtime + secrets + outputs:
+    D:\records\
+
+- Publish repos (e.g. whitepup.github.io/store) are separate and receive
+  built assets copied from D:\records\outputs\...
+
+Mental model:
+- code\records = SOURCE
+- D:\records = RUNTIME (env + outputs)
+- GitHub Pages = FINAL PUBLISH (static)
+
+-----------------------------------------------------------------------------
+1. Global development rules & conventions
+-----------------------------------------------------------------------------
+1.1 THE .env RULE
+-----------------
+- The **only** correct .env location:
+      D:\records\.env
+- Every script that talks to Discogs must:
+      load .env from D:\records
+- Never ask David to make duplicate .envs.
+
+1.2 Runtime vs Repo
+--------------------
+- Everything large or produced at runtime (logs, HTML, caches, images)
+  belongs under:
+      D:\records\outputs\<tool>\
+- Source repo remains clean.
+
+1.3 ZIP DELIVERY RULE (CRITICAL)
+--------------------------------
+When I hand David a zip for a tool:
+- The zip MUST unpack FLAT into the correct tool folder such as:
+      code\records\tools\hunt\
+- NO extra root folders inside the zip.
+- NEVER include placeholder or dummy files.
+- ALWAYS include **real working versions** of every file in that tool,
+  unless David explicitly asks for an empty template.
+
+1.4 Batch Launchers
+-------------------
+- Use the standard pattern:
+  - Detect py/python
+  - cd into tool folder
+  - run main script
+  - pause at end
+- Combined launchers (build → hunt) are acceptable and preferred when
+  requested.
+
+1.5 Logging
+-----------
+- Major tools must send stdout+stderr to logs under:
+      D:\records\outputs\<tool>\
+- Builds get their own log, and run phases get separate logs when useful.
+- Console should still show progress.
+
+-----------------------------------------------------------------------------
+2. Tool-specific knowledge
+-----------------------------------------------------------------------------
+2.1 offline_gallery
+-------------------
+- Pulls Discogs folder contents
+- Generates static HTML gallery + images
+- Uses D:\records\offline_gallery or D:\records\outputs\offline_gallery
+  (be consistent with current version)
+- Folder IDs define what gets shown
+
+2.2 store
+---------
+- `store.py` generates the inventory JSON and site assets
+- Inputs include pricing overrides
+- Outputs go under:
+      D:\records\outputs\store\
+- Deployment copies to GitHub Pages
+- Cart button was removed — do NOT resurrect without request
+
+2.3 ad_generator
+----------------
+- Builds image grids for ads
+- Uses cached cover art
+- Output folder:
+      D:\records\outputs\ad_generator\
+- Multiple .bat variations: grid size, genre grouping, etc.
+
+2.4 hunt
+--------
+Location:
+    code\records\tools\hunt\
+
+Purpose:
+- Identify likely-to-sell titles (by decade)
+- Prepare Discogs folders + grid HTML
+- Assist David hunting records in real marketplaces
+
+Hunt system consists of two phases:
+
+(1) hunt_build_top_sellers.py
+    - Uses Discogs API to gather candidate releases
+    - As of Jan 2026 it can generate .csv OR .xlsx files
+    - Writes to:
+          C:\Users\David\Documents\GitHub\code\records\data_backups\
+      Named like:
+          1950s_top_sellers_1000.csv
+    - Must safely skip decades with no candidates
+    - Must NOT crash if some decades are missing
+
+(2) hunt.py
+    - Reads both .xlsx AND .csv now
+      (this was updated Jan 2026 — critical rule)
+    - Updates Discogs collection folders:
+          hunt, hunt_1950, hunt_1960 ... hunt_2020
+    - Handles 409 “already there” gracefully
+    - Falls back to search if discogs_id missing
+    - Downloads cover images
+    - Generates HTML pages:
+          D:\records\outputs\hunt\<decade>.html
+          D:\records\outputs\hunt\index.html
+
+Other important hunt rules:
+- All logs + outputs:
+      D:\records\outputs\hunt\
+- Use caching where possible to save API calls
+- Be mindful of 429 rate limiting
+- Filenames must match the hunt.py glob pattern
+- DO NOT assume files exist — always check
+
+-----------------------------------------------------------------------------
+3. New rules from the Jan 2026 sessions
+-----------------------------------------------------------------------------
+✓ NEVER include placeholder code in zips
+✓ Zips must contain ONLY full, working files
+✓ hunt.py **must support .csv input**
+✓ If build script produces 0 results, hunt still must use existing files
+✓ Combined “build + hunt” bat is valid
+✓ If /mnt/data or chat gets unstable, create a fresh chat + provide a summary
+
+-----------------------------------------------------------------------------
+4. Lessons learned (short form)
+-----------------------------------------------------------------------------
+- No new .env locations
+- No writing big outputs into code repo
+- No nested zips
+- No placeholders in production bundles
+- Always include complete working tool state when asked for a zip
+- Support recovery from partial runs (don’t assume prior files are gone)
+
+-----------------------------------------------------------------------------
+5. What happens next time
+-----------------------------------------------------------------------------
+When David starts a new chat and pastes this file:
+- I adopt the conventions above immediately
+- I assume the hunt tool uses both CSV and XLSX
+- I deliver zips correctly and safely
+- I default to giving ready-to-run files, no walls of text unless requested
+- At end of session, I update this file again if asked

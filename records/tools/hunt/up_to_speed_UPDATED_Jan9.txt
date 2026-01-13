@@ -1,0 +1,157 @@
+# up_to_speed (Jan 9, 2026) — Working Context + Rules
+Paste into a fresh chat to restore state.
+
+============================================================
+0. Big Picture Architecture (unchanged)
+============================================================
+SOURCE CODE REPO (no secrets):
+    C:\Users\David\Documents\GitHub\code\records\
+
+RUNTIME + secrets + outputs:
+    D:\records\
+    - .env lives here
+    - outputs written under outputs/<tool>
+
+GitHub Pages publish is separate (static output copies).
+
+============================================================
+1. Global Rules
+============================================================
+1.1 .env RULE (CRITICAL)
+- The ONLY valid .env:
+      D:\records\.env
+- All scripts MUST load secrets from THERE.
+- Never duplicate, never hardcode keys, never ask to create a second copy.
+
+1.2 Runtime vs Repo
+- Code lives under GitHub repo.
+- Images, logs, caches, HTML ALWAYS in D:\records\outputs\<tool>.
+- Repo must stay clean of runtime junk.
+
+1.3 ZIPS
+- Deliver READY-TO-RUN files ONLY.
+- ZIP must unpack FLAT into tool folder.
+- NO placeholder files.
+- Include .bat launchers.
+- Include full tool state unless user requests partial.
+
+1.4 Batch launchers
+- cd to tool folder
+- run py -3 script
+- end with pause
+- Combined build→run bat is allowed when asked
+
+1.5 Logging
+- All major tools write logs to:
+      D:\records\outputs\<tool>\*.log
+- Show progress to console too.
+
+============================================================
+2. Tool Rules
+============================================================
+2.1 offline_gallery
+- Read Discogs folders
+- Generate static HTML + cover downloads
+- Output under D:\records\outputs\offline_gallery
+- Folder IDs define what appears
+- Currently relies on token auth only (works for GET)
+
+2.2 store
+- Generates store_inventory.json + site assets
+- Output under D:\records\outputs\store
+- Cart button removed and stays removed unless requested
+
+2.3 ad_generator
+- Makes genre or decade grids using existing cached images
+- Output under D:\records\outputs\ad_generator
+- Must reuse existing art when possible
+
+2.4 hunt (two-phase system)
+PHASE 1 — hunt_build_top_sellers.py
+- Reads Discogs marketplace
+- Writes *_top_sellers_*.csv/.xlsx into:
+      C:\Users\David\Documents\GitHub\code\records\data_backups\
+
+PHASE 2 — hunt.py
+- MUST support both CSV *and* XLSX
+- Reads top_sellers files
+- Downloads covers
+- Builds HTML pages per decade
+- Writes to:
+      D:\records\outputs\hunt\
+- Uses caching + rate limit handling
+- Supports GET-only mode
+
+NEW reality (Jan 2026):
+- Discogs has started rejecting POST collection writes
+  using personal tokens (403). OAuth required for writes.
+
+HUNT MODES
+- GET-only (current default working mode)
+- Cover priority: pick 'primary' image first
+- UI behavior: number + rating on cards
+- Fullscreen lightbox works and stays
+
+============================================================
+3. Latest Lessons (Jan 9)
+============================================================
+✔ POST to Discogs collection fails now → require OAuth if adding items
+✔ GET requests + cover downloading work
+✔ "primary" image selection is the right approach
+✔ CSV/XLSX mixed inputs reliable
+✔ Cover caches should persist across runs
+✔ Auto-cleaning disc images is error-prone:
+    - strict and smart heuristic runs removed valid covers
+    - manual review flow is safest going forward
+✔ Provide tools for:
+    - cleaning light
+    - OR manual keep/move review
+✔ Do not auto-delete covers anymore unless user requests
+
+============================================================
+4. Updated defaults & expectations
+============================================================
+- When delivering HUNT tools:
+    * Default to GET-only,
+    * No Discogs folder writes unless OAuth system is added
+- Cover selection must always prefer 'primary' when present
+- Cleaner tools must never delete by default → move instead
+- Manual-review screenplay is reliable fallback
+- If user wants Discogs adds to work again → build OAuth flow
+
+============================================================
+5. Workflow Recovery Rules
+============================================================
+- If /mnt/data breaks or chat corrupts:
+    1) Say "Start new chat"
+    2) Provide context .txt for user to paste
+    3) Restart with clean assumptions
+
+============================================================
+6. User Preferences Snapshot
+============================================================
+- Always deliver zips, no walls of text by default
+- Bundles must include:
+    * .py scripts
+    * matching .bat launchers
+- No placeholders
+- Assume CSV + XLSX coexist
+- Outputs must be viewable offline
+- User likes fast iterations and short responses
+- Explicit request needed for:
+    * store/cart UI changes
+    * Discogs POST/OAuth
+    * auto image deletion
+
+============================================================
+7. If starting next session
+============================================================
+- Assume hunt.py supports GET-only
+- Assume manual image cleanup preferred
+- Assume user wants "primary" covers
+- Assume rating + numbering UI required
+- Before building write-enabled scripts → ask:
+      "Do you want OAuth enabled?"
+
+============================================================
+END OF FILE
