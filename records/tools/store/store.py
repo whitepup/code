@@ -90,88 +90,140 @@ def load_pricing_overrides(path: Path) -> Dict[str, dict]:
     return out
 
 
-def read_records_csv_dedup(path: Path, pricing: Dict[str, dict]) -> List[dict]:
+def discover_records_csv_files(root: Path) -> List[Path]:
+    """Return all records.csv files under offline_gallery output.
+
+    Supports both legacy layout:
+      offline_gallery/records.csv
+    and newer layouts where each tab/folder is written under a subfolder:
+      offline_gallery/<tab>/records.csv
     """
-    Reads offline_gallery records.csv and returns *deduped* store items grouped by Artist+Title.
+    files: List[Path] = []
+    root = Path(root)
+    p0 = root / "records.csv"
+    if p0.exists():
+        files.append(p0)
+    for p in root.rglob("records.csv"):
+        if p not in files:
+            files.append(p)
+    return files
+
+
+def read_records_csv_dedup(paths, pricing: Dict[str, dict]) -> List[dict]:
+    """
+    Reads one or more offline_gallery records.csv files and returns *deduped* store items grouped by Artist+Title.
     Applies pricing overrides by key.
     """
-    if not path.exists():
-        raise FileNotFoundError(f"Missing records.csv at: {path}")
+    if isinstance(paths, (str, Path)):
+        paths = [Path(paths)]
+    paths = [Path(p) for p in (paths or []) if Path(p).exists()]
+    if not paths:
+        raise FileNotFoundError(f"Missing records.csv under: {OFFLINE_OUT}")
 
     groups: Dict[str, dict] = {}
     years_by_key: Dict[str, List[Optional[int]]] = defaultdict(list)
+    high_sold_by_key: Dict[str, List[Optional[float]]] = defaultdict(list)
+    seen_rids: set[str] = set()
 
-    with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            folder = _norm(row.get("folder",""))
-            if folder.lower() != "for sale":
-                continue
+    for path in paths:
+        with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                folder = _norm(row.get("folder", ""))
+                # Include all "For Sale*" folders (LPs, 7\", 10\", 78s, etc.)
+                if not folder.lower().startswith("for sale"):
+                    continue
 
-            rid = _norm(row.get("release_id",""))
-            if not rid:
-                continue
+                rid = _norm(row.get("release_id", ""))
+                if not rid:
+                    continue
+                if rid in seen_rids:
+                    continue
+                seen_rids.add(rid)
 
-            artist = _norm(row.get("artist",""))
-            title = _norm(row.get("title",""))
-            if not artist and not title:
-                continue
+                artist = _norm(row.get("artist", ""))
+                title = _norm(row.get("title", ""))
+                if not artist and not title:
+                    continue
 
-            key = _key_artist_title(artist, title)
+                key = _key_artist_title(artist, title)
 
-            year_raw = _norm(row.get("year",""))
-            y = _safe_int_year(year_raw)
-            years_by_key[key].append(y)
+                year_raw = _norm(row.get("year", ""))
+                y = _safe_int_year(year_raw)
+                years_by_key[key].append(y)
 
-            country = _norm(row.get("country",""))
-            label = _norm(row.get("label",""))
-            catno = _norm(row.get("catno",""))
-            genre = _norm(row.get("genre","")) or "Unknown"
-            style = _norm(row.get("style",""))
-            img = _norm(row.get("img",""))  # relative like images/abcd.jpeg
+                # Discogs high sold value (may be absent depending on offline_gallery version)
+                high_sold = None
+                for col in (
+                    "high_sold_value",
+                    "sold_high",
+                    "high_sold",
+                    "sold_value_high",
+                    "discogs_high_sold_value",
+                    "highest_sold",
+                    "high_sold_usd",
+                ):
+                    if col in row and _norm(row.get(col, "")):
+                        try:
+                            high_sold = float(re.sub(r"[^0-9.\-]", "", _norm(row.get(col, ""))))
+                        except Exception:
+                            high_sold = None
+                        if high_sold is not None:
+                            break
+                high_sold_by_key[key].append(high_sold)
 
-            if key not in groups:
-                blob = f"{artist} {title}".strip().lower()
-                groups[key] = {
-                    "key": key,
-                    "release_id": rid,                 # representative
-                    "variant_release_ids": [rid],      # all rids in this group
-                    "qty": 1,
-                    "artist": artist,
-                    "title": title,
-                    "year": year_raw,
-                    "decade": "Unknown",
-                    "country": country,
-                    "label": label,
-                    "catno": catno,
-                    "genre": genre,
-                    "style": style,
-                    "condition": "Not yet inspected",
-                    "sleeve_condition": "",
-                    "status": "available",
-                    "price": "",
-                    "notes": "",
-                    "img": img,
-                    "search_blob": blob,
-                }
-            else:
-                g = groups[key]
-                g["qty"] = int(g.get("qty", 1)) + 1
-                g["variant_release_ids"].append(rid)
-                if not g.get("img") and img:
-                    g["img"] = img
-                for fld, val in [("label", label), ("catno", catno), ("genre", genre), ("style", style), ("country", country)]:
-                    if (not g.get(fld)) and val:
-                        g[fld] = val
+                country = _norm(row.get("country", ""))
+                label = _norm(row.get("label", ""))
+                catno = _norm(row.get("catno", ""))
+                fmt = _norm(row.get("format", ""))
+                img = _norm(row.get("cover_image", "")) or _norm(row.get("image", "")) or _norm(row.get("img", ""))
 
+                # Only keep one representative row per key (dedup)
+                if key not in groups:
+                    groups[key] = {
+                        "key": key,
+                        "artist": artist,
+                        "title": title,
+                        "country": country,
+                        "label": label,
+                        "catno": catno,
+                        "format": fmt,
+                        "rid": rid,
+                        "img": img,
+                        "price": "",
+                        "status": "",
+                        "condition": "",
+                        "sleeve_condition": "",
+                        "notes": "",
+                    }
+
+    # Apply pricing overrides + defaults
     items: List[dict] = []
     for key, g in groups.items():
-        # Apply pricing overrides by key
-        if key in pricing:
-            p = pricing[key]
-            for fld in ("price","status","condition","sleeve_condition","notes"):
-                if p.get(fld):
-                    g[fld] = p[fld]
+        ov = pricing.get(key)
+        if ov:
+            if _norm(ov.get("price", "")):
+                g["price"] = _norm(ov.get("price", ""))
+            if _norm(ov.get("status", "")):
+                g["status"] = _norm(ov.get("status", ""))
+            if _norm(ov.get("condition", "")):
+                g["condition"] = _norm(ov.get("condition", ""))
+            if _norm(ov.get("sleeve_condition", "")):
+                g["sleeve_condition"] = _norm(ov.get("sleeve_condition", ""))
+            if _norm(ov.get("notes", "")):
+                g["notes"] = _norm(ov.get("notes", ""))
+
+        # If no override price: use Discogs high sold value, floor $4, round to nearest $.
+        # If no sold value available, default to $9.
+        if not _norm(str(g.get("price", ""))):
+            vals = [v for v in high_sold_by_key.get(key, []) if isinstance(v, float) and v > 0]
+            if vals:
+                p = int(round(max(vals)))
+                if p < 4:
+                    p = 4
+                g["price"] = str(p)
+            else:
+                g["price"] = "9"
 
         chosen = _choose_year(years_by_key.get(key, []))
         if chosen is not None:
@@ -208,15 +260,16 @@ HTML = """<!doctype html>
     .btn:disabled { opacity: .45; cursor: not-allowed; }
     .cartbtn { margin-left: auto; white-space: nowrap; }
     .content { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 14px; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
-    .card { border: 1px solid #eee; border-radius: 14px; padding: 12px; display: flex; gap: 12px; }
-    .cover { width: 88px; height: 88px; border-radius: 10px; object-fit: cover; background: #f5f5f5; flex: 0 0 auto; }
+    .grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; }
+    .card { border: 1px solid #eee; border-radius: 10px; padding: 6px 8px; display: flex; align-items: center; gap: 8px; }
+    .cover { width: 64px; height: 64px; border-radius: 8px; object-fit: cover; background: #f5f5f5; flex: 0 0 auto; }
     .meta { flex: 1 1 auto; min-width: 0; }
     .artist { font-weight: 800; }
     .title2 { margin-top: 2px; }
+    .yearline { margin-top: 2px; font-size: 12px; color: #666; }
     .line { margin-top: 6px; font-size: 12px; color: #333; }
     .muted { color: #666; }
-    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+    .row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 4px; }
     .price { font-weight: 900; }
     .badge { font-size: 12px; padding: 4px 8px; border-radius: 999px; border: 1px solid #ddd; background: #fafafa; }
     .badge.pending { background: #fff4b8; border-color: #e5d27a; }
@@ -250,7 +303,12 @@ HTML = """<!doctype html>
 .cartrow .meta { min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
 #cartText { overflow-x: hidden; white-space: pre-wrap; }
 
-  </style>
+  
+    .pricecol { min-width: 56px; text-align: center; font-weight: 900; font-size: 13px; }
+    .controlsRow { display: flex; flex-direction: column; align-items: center; gap: 4px; min-width: 40px; }
+    .controlsRow .btn { padding: 3px 5px; font-size: 11px; }
+    .controlsRow .small { font-size: 11px; }
+</style>
 </head>
 <body>
   <div class="header">
@@ -288,6 +346,7 @@ HTML = """<!doctype html>
   </div>
 
 <script>
+document.addEventListener("DOMContentLoaded", function(){
 (function(){
   const $ = (id)=>document.getElementById(id);
   const state = { items: [], filtered: [], cart: {} };
@@ -434,77 +493,83 @@ function updateCartButton(){
     const grid = $("grid");
     grid.innerHTML = "";
     state.filtered.forEach(it=>{
-      const s = (it.status||"available").toLowerCase();
-      const disabled = (s==="pending"||s==="sold");
-      const inCart = state.cart[it.release_id]||0;
+      const inCart = state.cart[it.release_id] ? 1 : 0;
 
       const card = document.createElement("div");
-      card.className="card";
+      card.className = "card";
 
+      // Price on far left
+      const priceCol = document.createElement("div");
+      priceCol.className = "pricecol";
+      const priceText = money(it.price);
+      priceCol.textContent = priceText || "";
+
+      // Vertical controls column next: +, -, ? buttons
+      const controls = document.createElement("div");
+      controls.className = "controlsRow";
+
+      function makeIconBtn(svg, label){
+        const b = document.createElement("button");
+        b.className = "btn iconbtn";
+        b.setAttribute("aria-label", label);
+        b.innerHTML = svg;
+        return b;
+      }
+
+      const plusSvg = '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"/></svg>';
+      const minusSvg = '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M5 12h14" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"/></svg>';
+      const qSvg = '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M9.5 9a3 3 0 1 1 4.2 2.7c-.9.4-1.2.8-1.2 1.8v.5" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/><path d="M12 18h.01" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round"/></svg>';
+
+      const plus = makeIconBtn(plusSvg, "Add");
+      plus.disabled = inCart > 0;
+      plus.onclick = ()=>{
+        if(state.cart[it.release_id]) return;
+        state.cart[it.release_id] = 1;
+        saveCart(); updateCartButton(); render();
+      };
+
+      const minus = makeIconBtn(minusSvg, "Remove");
+      minus.disabled = inCart <= 0;
+      minus.onclick = ()=>{
+        if(!state.cart[it.release_id]) return;
+        delete state.cart[it.release_id];
+        saveCart(); updateCartButton(); render();
+      };
+
+      const infoBtn = makeIconBtn(qSvg, "Details");
+      infoBtn.onclick = ()=>openItemModal(it);
+
+      // + above -
+      controls.appendChild(plus);
+      controls.appendChild(minus);
+      controls.appendChild(infoBtn);
+
+      // Image next
       const img = document.createElement("img");
-      img.className="cover";
-      img.alt = `${it.artist} - ${it.title}`;
-      img.src = it.img || "";
+      img.className = "cover";
       img.loading = "lazy";
-      card.appendChild(img);
+      img.src = it.img || "";
+      img.alt = `${it.artist || ""} — ${it.title || ""}`.trim();
+      img.onerror = ()=>{ img.style.visibility="hidden"; };
 
+      // Title + artist stacked vertically to the right
       const meta = document.createElement("div");
-      meta.className="meta";
+      meta.className = "meta";
       meta.innerHTML = `
         <div class="artist">${escapeHtml(it.artist || "")}</div>
         <div class="title2">${escapeHtml(it.title || "")}</div>
-        <div class="line">
-          <span class="nowrap">${escapeHtml(it.year || "?" )}</span>
-          <span class="muted">•</span>
-          <span class="nowrap">${escapeHtml(it.label || "")}</span>
-          <span class="muted">•</span>
-          <span class="nowrap">${escapeHtml(it.catno || "")}</span>
-        </div>
-        <div class="line muted">${escapeHtml(it.genre || "")}${it.style ? " • " + escapeHtml(it.style) : ""}</div>
-        <div class="row">
-          ${badge(it.status)}
-          ${it.price ? `<span class="price">${escapeHtml(money(it.price))}</span>` : ""}
-          ${it.qty>1 ? `<span class="qtypill">Qty: ${it.qty}</span>` : ""}
-        </div>
+            <div class="yearline">${it.year ? escapeHtml(it.year) : ""}</div>
       `;
+
+      card.appendChild(priceCol);
+      card.appendChild(controls);
+      card.appendChild(img);
       card.appendChild(meta);
-
-      const row = document.createElement("div");
-      row.className="row";
-      row.style.marginTop="10px";
-
-      const minus = document.createElement("button");
-      minus.className="btn";
-      minus.textContent="-";
-      minus.disabled = disabled || inCart<=0;
-      minus.onclick = ()=>{
-        state.cart[it.release_id] = Math.max(0, (state.cart[it.release_id]||0) - 1);
-        if(state.cart[it.release_id]===0) delete state.cart[it.release_id];
-        saveCart(); updateCartButton(); applyFilters();
-      };
-
-      const plus = document.createElement("button");
-      plus.className="btn";
-      plus.textContent="+";
-      plus.disabled = disabled;
-      plus.onclick = ()=>{
-        state.cart[it.release_id] = (state.cart[it.release_id]||0) + 1;
-        saveCart(); updateCartButton(); applyFilters();
-      };
-
-      const qty = document.createElement("span");
-      qty.className="small muted";
-      qty.textContent = `In cart: ${inCart}`;
-
-      row.appendChild(minus);
-      row.appendChild(plus);
-      row.appendChild(qty);
-
-      meta.appendChild(row);
 
       grid.appendChild(card);
     });
     setFilterOptions();
+
   }
 
   function escapeHtml(s){
@@ -514,6 +579,40 @@ function updateCartButton(){
       .replaceAll(">","&gt;")
       .replaceAll('"',"&quot;")
       .replaceAll("'","&#39;");
+  }
+
+
+  function openItemModal(it){
+    const modal = $("itemModal");
+    if(!modal) return;
+    const titleEl = $("itemModalTitle");
+    const bodyEl = $("itemModalBody");
+    if(titleEl){
+      titleEl.textContent = [it.artist || "", it.title || ""].filter(Boolean).join(" — ");
+    }
+    if(bodyEl){
+      const year = it.year || "?";
+      const label = it.label || "";
+      const catno = it.catno || "";
+      const genre = it.genre || "";
+      bodyEl.innerHTML = `
+        <p><b>Year:</b> ${escapeHtml(year)}</p>
+        <p><b>Label:</b> ${escapeHtml(label)}</p>
+        <p><b>Catalog #:</b> ${escapeHtml(catno)}</p>
+        <p><b>Genre:</b> ${escapeHtml(genre)}</p>
+      `;
+    }
+    modal.style.display = "flex";
+    modal.classList.add("open");
+    modal.setAttribute("aria-hidden","false");
+  }
+
+  function closeItemModal(){
+    const modal = $("itemModal");
+    if(!modal) return;
+    modal.style.display = "none";
+    modal.classList.remove("open");
+    modal.setAttribute("aria-hidden","true");
   }
 
   function openCart(){
@@ -534,7 +633,10 @@ $("modal").classList.add("open");
     loadCart();
     updateCartButton();
 
-    $("q").addEventListener("input", ()=>applyFilters());
+    const itemClose = $("itemModalClose");
+    if(itemClose){ itemClose.addEventListener("click", closeItemModal); }
+
+$("q").addEventListener("input", ()=>applyFilters());
     $("artist").addEventListener("change", ()=>applyFilters());
     $("genre").addEventListener("change", ()=>applyFilters());
     $("decade").addEventListener("change", ()=>applyFilters());
@@ -549,6 +651,11 @@ $("modal").classList.add("open");
     $("cartOpen").addEventListener("click", openCart);
     $("modalClose").addEventListener("click", closeCart);
     $("modal").addEventListener("click", (e)=>{ if(e.target===$("modal")) closeCart(); });
+
+    // Item modal close (backdrop + Esc)
+    const im = $("itemModal");
+    if(im){ im.addEventListener("click", (e)=>{ if(e.target===im) closeItemModal(); }); }
+    document.addEventListener("keydown", (e)=>{ if(e.key==="Escape"){ closeCart(); closeItemModal(); } });
 
     $("copyBtn").addEventListener("click", async ()=>{
       try{
@@ -582,7 +689,19 @@ $("modal").classList.add("open");
   }
   boot();
 })();
+});
 </script>
+
+
+<div id="itemModal" class="modal" aria-hidden="true" style="display:none">
+  <div class="modalbox">
+    <div class="modalhead">
+      <h2 id="itemModalTitle">Record details</h2>
+      <button id="itemModalClose" class="btn close">Close</button>
+    </div>
+    <div class="modal-body small" id="itemModalBody" style="overflow-y:auto;max-height:70vh;"></div>
+  </div>
+</div>
 
 <div id="helpModal" class="modal" aria-hidden="true" style="display:none">
   <div class="modalbox">
@@ -594,7 +713,7 @@ $("modal").classList.add("open");
       <p><b>Collection focus:</b> Classic pop, jazz, easy listening, and vocal LPs.</p>
       <p><b>How to use:</b> Browse, use search and filters, then tap <b>Add to Cart</b> on anything you’re interested in.</p>
       <p>The cart builds a simple text list you can <b>copy/paste into a Facebook Marketplace message</b> when you’re ready to reach out.</p>
-      <p>Status/condition may be uninspected unless noted. <b>Damaged records will be discounted.</b></p>
+      <p><b>If records is not in very good condition a discount will be applied</b></p>
       <p>Feel free to message for detailed grading or questions — happy to help.</p>
     </div>
   </div>
@@ -624,9 +743,9 @@ def main() -> int:
     SITE_DIR.mkdir(parents=True, exist_ok=True)
     (SITE_DIR / "images").mkdir(parents=True, exist_ok=True)
 
-    records_csv = OFFLINE_OUT / "records.csv"
+    records_csv_files = discover_records_csv_files(OFFLINE_OUT)
     pricing = load_pricing_overrides(PRICE_FILE)
-    items = read_records_csv_dedup(records_csv, pricing)
+    items = read_records_csv_dedup(records_csv_files, pricing)
 
     inv_path = SITE_DIR / "store_inventory.json"
     inv_path.write_text(json.dumps({"items": items}, ensure_ascii=False, indent=2), encoding="utf-8")
