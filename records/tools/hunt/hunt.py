@@ -413,34 +413,109 @@ def choose_cover(rel: Dict) -> str:
 
 # ---------- HTML writer ----------
 
-def write_html(all_items: Dict[str, List[Dict]]) -> None:
+def write_index_html(items: List[Dict]) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     COVERS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Index page
-    idx = OUTPUT_DIR / "index.html"
-    decades = sorted(all_items.keys())
-    lines = ["<html><body><h1>Top Sellers (COVERS)</h1>"]
-    for d in decades:
-        lines.append(f"<a href='{d}.html'>{d}</a><br>")
-    lines.append("</body></html>")
-    idx.write_text("\n".join(lines), encoding="utf-8")
+    # Shared styling
+    style = '''
+<style>
+  body { font-family: Arial, Helvetica, sans-serif; }
+  .controls { position: sticky; top: 0; background: white; padding: 10px 0 12px 0; border-bottom: 1px solid #ddd; }
+  .controls label { margin-right: 10px; }
+  .controls input { width: 90px; padding: 4px 6px; }
+  .controls .count { margin-left: 14px; color: #444; }
+  .grid { display: flex; flex-wrap: wrap; gap: 18px; padding-top: 14px; }
+  .card { display: inline-block; }
+  .card img { display: block; width: auto; height: auto; }
+  .meta { margin-top: 6px; max-width: 220px; }
+  .meta a { text-decoration: none; color: inherit; }
+  .meta a:hover { text-decoration: underline; }
+</style>
+'''.strip()
 
-    # Per-decade pages
-    for decade_label, items in all_items.items():
-        p = OUTPUT_DIR / f"{decade_label}.html"
-        body = ["<html><body>", f"<h1>{decade_label}</h1>", "<ul>"]
-        for it in items:
-            img = it.get("img_local")
-            pic = f"<img src='{img}' height='80'>" if img else ""
-            artist = it.get("artist", "?")
-            title = it.get("title", "?")
-            body.append(f"<li>{pic} {artist} — {title}</li>")
-        body.append("</ul></body></html>")
-        p.write_text("\n".join(body), encoding="utf-8")
+    # Compute year bounds (ignore 0/None)
+    years = [int(it["year"]) for it in items if str(it.get("year") or "").isdigit() and int(it["year"]) > 0]
+    min_year = min(years) if years else ""
+    max_year = max(years) if years else ""
+
+    # Index page (single page, all records)
+    idx = OUTPUT_DIR / "index.html"
+    lines: List[str] = [
+        "<html><head>",
+        "<meta charset='utf-8'>",
+        style,
+        "</head><body>",
+        "<div class='controls'>",
+        "<label>Min year <input id='minYear' type='number' inputmode='numeric'></label>",
+        "<label>Max year <input id='maxYear' type='number' inputmode='numeric'></label>",
+        "<span class='count' id='count'></span>",
+        "</div>",
+        "<div class='grid' id='grid'>",
+    ]
+
+    for it in items:
+        img = it.get("img_local")
+        artist = it.get("artist", "?")
+        title = it.get("title", "?")
+        year = it.get("year") or ""
+        discogs_url = it.get("discogs_url")
+
+        pic = f"<img src='{img}'>" if img else ""
+        label = f"{year} — {artist} — {title}" if year else f"{artist} — {title}"
+        if discogs_url:
+            meta = f"<a href='{discogs_url}' target='_blank' rel='noopener noreferrer'>{label}</a>"
+        else:
+            meta = label
+
+        year_attr = year if str(year).isdigit() else ""
+        lines.append(f"<div class='card' data-year='{year_attr}'>")
+        if pic:
+            lines.append(pic)
+        lines.append(f"<div class='meta'>{meta}</div>")
+        lines.append("</div>")
+
+    lines += [
+        "</div>",
+        "<script>",
+        f"const minDefault = {json.dumps(min_year)};",
+        f"const maxDefault = {json.dumps(max_year)};",
+        "const minInput = document.getElementById('minYear');",
+        "const maxInput = document.getElementById('maxYear');",
+        "const countEl = document.getElementById('count');",
+        "const cards = Array.from(document.querySelectorAll('.card'));",
+        "minInput.value = minDefault;",
+        "maxInput.value = maxDefault;",
+        "function parseNum(v){ const n = parseInt(v, 10); return Number.isFinite(n) ? n : null; }",
+        "function applyFilter(){",
+        "  const minY = parseNum(minInput.value);",
+        "  const maxY = parseNum(maxInput.value);",
+        "  let shown = 0;",
+        "  for (const c of cards){",
+        "    const yRaw = c.getAttribute('data-year');",
+        "    const y = parseNum(yRaw);",
+        "    let ok = true;",
+        "    if (minY !== null && y !== null && y < minY) ok = false;",
+        "    if (maxY !== null && y !== null && y > maxY) ok = false;",
+        "    // If a card has no year, hide it when any bound is set.",
+        "    if ((minY !== null || maxY !== null) && y === null) ok = false;",
+        "    c.style.display = ok ? 'inline-block' : 'none';",
+        "    if (ok) shown += 1;",
+        "  }",
+        "  countEl.textContent = `${shown} / ${cards.length} shown`;",
+        "}",
+        "minInput.addEventListener('input', applyFilter);",
+        "maxInput.addEventListener('input', applyFilter);",
+        "applyFilter();",
+        "</script>",
+        "</body></html>",
+    ]
+
+    idx.write_text("\n".join(lines), encoding="utf-8")
 
 
 # ---------- main ----------
+
 
 def main() -> None:
     setup_logging()
@@ -457,13 +532,12 @@ def main() -> None:
         return
 
     cache: Dict[int, Dict] = {}
-    by_decade: Dict[str, List[Dict]] = {}
+    all_items: List[Dict] = []
 
     COVERS_DIR.mkdir(parents=True, exist_ok=True)
 
     for path in files:
-        decade_label = infer_decade(path)
-        by_decade.setdefault(decade_label, [])
+        # decade_label = infer_decade(path)  # no longer used (single-page index)
 
         if path.suffix.lower() == ".csv":
             rows = read_csv(path)
@@ -498,9 +572,15 @@ def main() -> None:
                 if dest.exists():
                     img_local = f"covers/{fname}"
 
-            by_decade[decade_label].append({"title": title, "artist": artist, "img_local": img_local})
-
-    write_html(by_decade)
+            discogs_url = (rel.get("uri") or "").strip() or f"https://www.discogs.com/release/{rid}"
+                        # Year for filtering (Discogs 'year' is typically an int)
+            year_val = rel.get("year") or row.get("year") or row.get("release_year") or ""
+            year_str = str(year_val).strip()
+            year = int(year_str) if year_str.isdigit() else ""
+            all_items.append({"year": year, "title": title, "artist": artist, "img_local": img_local, "discogs_url": discogs_url})
+    # Sort: year asc (unknowns last), then artist/title
+    all_items.sort(key=lambda x: (x.get('year') or 9999, (x.get('artist') or '').lower(), (x.get('title') or '').lower()))
+    write_index_html(all_items)
 
 
 if __name__ == "__main__":

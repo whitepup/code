@@ -594,10 +594,13 @@ def cached_http_get_json(url: str, token: str, user_agent: str, cache: Dict[str,
                     return ent.get("json"), ent.get("status"), ent.get("err")
             except Exception:
                 pass
-    j, status, err = cached_http_get_json(url, token, user_agent, cache, ttl_days, sleep_s=sleep_s)
+    # Miss or expired entry -> fetch from network and populate cache
+    j, status, err = http_get_json(url, token, user_agent, sleep_s=sleep_s)
     if isinstance(cache, dict):
         cache[url] = {"ts": time.time(), "status": status, "err": err, "json": j}
     return j, status, err
+
+
 def paged_releases(url: str, token: str, user_agent: str, per_page: int = 100) -> Tuple[List[Dict[str, Any]], Dict[str,int]]:
     out: List[Dict[str, Any]] = []
     page = 1
@@ -884,8 +887,6 @@ def main() -> int:
         print("ERROR: Could not parse DISCOGS_FOLDERS.", flush=True)
         return 5
 
-    folder_name, folder_id = pick_folder(folders)
-
     OUT_ROOT = records_out / "store"
     SITE_DIR = OUT_ROOT / "site"
     CACHE_PATH = OUT_ROOT / "cache.json"
@@ -893,14 +894,47 @@ def main() -> int:
 
     print("=== Store Builder (Legacy Layout + Discogs prices) ===", flush=True)
     print(f"DISCOGS user: {username}", flush=True)
-    print(f"Folder: {folder_name} ({folder_id})", flush=True)
+    print(f"Folders: {len(folders)}", flush=True)
+    for fn, fid in folders:
+        print(f"  - {fn} ({fid})", flush=True)
     print(f"Floor: ${int(floor)}", flush=True)
     print(f"Output site: {SITE_DIR}", flush=True)
     print(f"Cache: {CACHE_PATH}", flush=True)
 
-    releases_url = f"{API_BASE}/users/{urllib.parse.quote(username)}/collection/folders/{folder_id}/releases"
-    releases, rel_stats = paged_releases(releases_url, token, user_agent, per_page=100)
-    print(f"Collection API pages: {rel_stats.get('pages',0)} | releases rows: {len(releases)} | http_errors: {rel_stats.get('http_errors',0)}", flush=True)
+    # Fetch releases across *all* folders listed in DISCOGS_FOLDERS, then de-dupe by release_id.
+    releases_all: List[Dict[str, Any]] = []
+    combined_stats = {"pages": 0, "http_errors": 0}
+    for fn, fid in folders:
+        releases_url = f"{API_BASE}/users/{urllib.parse.quote(username)}/collection/folders/{fid}/releases"
+        rels, rel_stats = paged_releases(releases_url, token, user_agent, per_page=100)
+        releases_all.extend(rels)
+        combined_stats["pages"] += int(rel_stats.get("pages", 0) or 0)
+        combined_stats["http_errors"] += int(rel_stats.get("http_errors", 0) or 0)
+        print(f"Folder fetched: {fn} ({fid}) | pages: {rel_stats.get('pages',0)} | rows: {len(rels)} | http_errors: {rel_stats.get('http_errors',0)}", flush=True)
+
+    # De-dupe by Discogs release_id (basic_information.id)
+    seen_rids: set[int] = set()
+    releases: List[Dict[str, Any]] = []
+    dup_rows = 0
+    for rr in releases_all:
+        bi = rr.get("basic_information") or {}
+        rid = bi.get("id")
+        if rid is None:
+            continue
+        try:
+            rid_i = int(rid)
+        except Exception:
+            continue
+        if rid_i in seen_rids:
+            dup_rows += 1
+            continue
+        seen_rids.add(rid_i)
+        releases.append(rr)
+
+    print(
+        f"Collection API pages (sum): {combined_stats.get('pages',0)} | rows (raw): {len(releases_all)} | rows (dedup by release_id): {len(releases)} | dup_rows_dropped: {dup_rows} | http_errors (sum): {combined_stats.get('http_errors',0)}",
+        flush=True,
+    )
     # Quick live probe: attempt marketplace stats for first release_id to capture raw failure mode
     probe_rid = None
     for rr in releases:
