@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# store.py
+# store_data.py
 # Discogs collection -> store_inventory.json + legacy index.html layout (unchanged)
 
 from __future__ import annotations
@@ -8,436 +8,94 @@ import json
 import os
 import re
 import time
+import hashlib
+import csv
 from collections import defaultdict
 from pathlib import Path
+from typing import Optional
 from typing import Any, Dict, List, Optional, Tuple
 import urllib.parse
 import urllib.request
 import urllib.error
 
-API_BASE = "https://api.discogs.com"
+API_BASE = 
 
+# ---- local asset helpers ----
 
-# ---- table store page layout (offline_gallery-style) ----
-HTML = """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Record Store</title>
-  <style>
-    html, body { margin: 0; padding: 0; }
-    body { font-family: Arial, sans-serif; background: #fff; color: #111; }
-    .wrap { padding: 12px 14px 72px; }
-    table { border-collapse: collapse; width: 100%; }
-    th, td { border-bottom: 1px solid #eee; padding: 8px 10px; text-align: left; vertical-align: middle; }
-    th { position: sticky; top: 0; background: #fafafa; z-index: 10; user-select: none; }
-    .nowrap { white-space: nowrap; }
-    img.thumb { width: 56px; height: 56px; object-fit: cover; border-radius: 6px; background: #f5f5f5; }
-    a.dlink { color: inherit; text-decoration: none; }
-    a.dlink:hover { text-decoration: underline; }
+def _md5_16(s: str) -> str:
+    h = hashlib.md5(s.encode("utf-8", errors="ignore")).hexdigest()
+    return h[:16]
 
-    /* + / - controls */
-    .iconstack { display: flex; gap: 6px; align-items: center; }
-    .iconbtn { display:inline-flex; align-items:center; justify-content:center; width:34px; height:34px; padding:0;
-               border:1px solid #d6d6d6; background:#fff; border-radius:10px; cursor:pointer; }
-    .iconbtn:disabled { opacity: .45; cursor: not-allowed; }
-    .qty { min-width: 20px; text-align: center; font-weight: 700; }
+def ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
 
-    /* hover image overlay (offline_gallery style) */
-    #imgHoverOverlay{position:fixed;display:none;z-index:9999;pointer-events:none}
-    #imgHoverOverlay img{max-width:520px;max-height:520px;min-width:240px;min-height:240px;box-shadow:0 10px 30px rgba(0,0,0,0.35);background:#000;border-radius:10px}
-    #imgHoverOverlay img{width:auto;height:auto}
+def download_image(url: str, out_path: Path, timeout: int = 30) -> bool:
+    """Download url -> out_path if missing. Returns True if file exists after call."""
+    try:
+        if out_path.exists() and out_path.stat().st_size > 0:
+            return True
+    except Exception:
+        pass
+    if not url:
+        return False
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "records-store/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read()
+        ensure_dir(out_path.parent)
+        out_path.write_bytes(data)
+        return out_path.exists() and out_path.stat().st_size > 0
+    except Exception:
+        return False
 
-    /* cart button + modal */
-    .cartbtn { position: fixed; right: 14px; bottom: 14px; z-index: 100; border: 1px solid #d6d6d6; background: #fff;
-               border-radius: 12px; padding: 10px 12px; cursor: pointer; box-shadow: 0 6px 18px rgba(0,0,0,.08); }
-    .cartbtn .small { font-size: 12px; color: #666; display: block; margin-top: 2px; }
+def load_year_map(records_csv: Path) -> dict[int, str]:
+    """Optional: offline_gallery records.csv -> {release_id:int: year:str}."""
+    mp: dict[int, str] = {}
+    if not records_csv.exists():
+        return mp
+    try:
+        with records_csv.open("r", encoding="utf-8", errors="replace", newline="") as f:
+            reader = csv.DictReader(f)
+            # try common column names
+            for row in reader:
+                rid_s = (row.get("release_id") or row.get("rid") or row.get("id") or "").strip()
+                if not rid_s:
+                    continue
+                try:
+                    rid = int(rid_s)
+                except Exception:
+                    continue
+                year = (row.get("year") or row.get("released") or "").strip()
+                if year:
+                    mp[rid] = year
+    except Exception:
+        return mp
+    return mp
 
-    .modal { position: fixed; inset: 0; background: rgba(0,0,0,.35); display: none; align-items: center; justify-content: center; padding: 18px; z-index: 200; }
-    .modalbox { width: min(920px, 98vw); background: #fff; border-radius: 14px; border: 1px solid #e6e6e6; overflow: hidden; }
-    .modalhead { padding: 12px 14px; border-bottom: 1px solid #eee; display:flex; align-items:center; justify-content: space-between; gap: 10px;}
-    .modalbody { padding: 12px 14px; }
-    .modalfoot { padding: 12px 14px; border-top: 1px solid #eee; display:flex; gap:8px; flex-wrap: wrap; justify-content: flex-end; }
-    .btn { border: 1px solid #d6d6d6; background: #fff; padding: 8px 10px; border-radius: 10px; cursor: pointer; }
-    textarea { width: 100%; min-height: 240px; border: 1px solid #d6d6d6; border-radius: 10px; padding: 10px;
-               font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
-    .status { padding: 12px 14px; color: #666; font-size: 12px; }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div id="status" class="status">Loading…</div>
-    <table id="tbl" aria-label="Store inventory" style="display:none">
-      <thead>
-        <tr>
-          <th class="nowrap">price</th>
-          <th class="nowrap">+ / −</th>
-          <th class="nowrap">cover</th>
-          <th>artist</th>
-          <th>title</th>
-          <th class="nowrap">year</th>
-          <th class="nowrap">format</th>
-        </tr>
-      </thead>
-      <tbody id="tbody"></tbody>
-    </table>
-  </div>
+def format_display(basic_information: dict) -> str:
+    """Build a richer format string (e.g. Vinyl, 7\", 45 RPM, Single)."""
+    formats = basic_information.get("formats") or []
+    parts: list[str] = []
+    if isinstance(formats, list):
+        for f in formats:
+            if not isinstance(f, dict):
+                continue
+            name = _norm(f.get("name") or "")
+            desc = f.get("descriptions") or []
+            dparts = []
+            if isinstance(desc, list):
+                for d in desc:
+                    d = _norm(d)
+                    if d:
+                        dparts.append(d)
+            text = _norm(f.get("text") or "")
+            # keep compact
+            seg = ", ".join([p for p in [name] + dparts + ([text] if text else []) if p])
+            if seg:
+                parts.append(seg)
+    return " / ".join(parts) if parts else ""
+"https://api.discogs.com"
 
-  <button id="cartOpen" class="cartbtn" type="button">
-    Cart: <span id="cartCount">0</span> items
-    <span class="small">Total: $<span id="cartTotal">0</span></span>
-  </button>
-
-  <div id="cartModal" class="modal" aria-hidden="true">
-    <div class="modalbox">
-      <div class="modalhead">
-        <div style="font-weight:800">Cart</div>
-        <button id="cartClose" class="btn" type="button">Close</button>
-      </div>
-      <div class="modalbody">
-        <textarea id="cartText" spellcheck="false"></textarea>
-      </div>
-      <div class="modalfoot">
-        <button id="clearCartBtn" class="btn" type="button">Clear</button>
-        <button id="copyBtn" class="btn" type="button">Copy</button>
-      </div>
-    </div>
-  </div>
-
-  <script>
-  (function(){
-    const $ = (id)=>document.getElementById(id);
-
-    const state = { items: [], cart: {} };
-
-    function loadCart(){
-      try { state.cart = JSON.parse(localStorage.getItem("store_cart_v1")||"{}") || {}; }
-      catch(e){ state.cart = {}; }
-    }
-    function saveCart(){
-      try { localStorage.setItem("store_cart_v1", JSON.stringify(state.cart||{})); } catch(e){}
-    }
-    function cartQty(rid){ return Number(state.cart[String(rid)]||0) || 0; }
-
-    function money(n){
-      const x = Number(n||0);
-      if(!Number.isFinite(x)) return "0";
-      return String(Math.round(x));
-    }
-
-    function rebuildCartText(){
-      const lines = [];
-      let total = 0;
-      let count = 0;
-
-      for(const ridStr of Object.keys(state.cart||{})){
-        const qty = Number(state.cart[ridStr]||0) || 0;
-        if(qty <= 0) continue;
-
-        const it = state.items.find(x => String(x.rid) === String(ridStr));
-        if(!it) continue;
-
-        count += qty;
-        const p = Number(it.price||0) || 0;
-        total += p * qty;
-
-        const year = it.year ? String(it.year) : "";
-        const url = "https://www.discogs.com/release/" + encodeURIComponent(String(it.rid));
-        lines.push(`${qty} x ${it.artist} - ${it.title}${year ? " ("+year+")" : ""}  $${money(p)}  ${url}`);
-      }
-
-      lines.sort((a,b)=>a.localeCompare(b, undefined, {numeric:true, sensitivity:"base"}));
-      lines.push("");
-      lines.push(`TOTAL: $${money(total)}   ITEMS: ${count}`);
-
-      $("cartText").value = lines.join("\n");
-      $("cartTotal").textContent = money(total);
-      $("cartCount").textContent = String(count);
-    }
-
-    function updateRowQty(rid){
-      const el = document.querySelector(`[data-qty-for="${CSS.escape(String(rid))}"]`);
-      if(el) el.textContent = String(cartQty(rid));
-    }
-
-    function addToCart(rid, delta){
-      const k = String(rid);
-      const cur = cartQty(k);
-      const next = cur + delta;
-      if(next <= 0) delete state.cart[k];
-      else state.cart[k] = next;
-      saveCart();
-      updateRowQty(k);
-      rebuildCartText();
-    }
-
-    function openCart(){
-      $("cartModal").style.display = "flex";
-      $("cartModal").setAttribute("aria-hidden","false");
-      rebuildCartText();
-    }
-    function closeCart(){
-      $("cartModal").style.display = "none";
-      $("cartModal").setAttribute("aria-hidden","true");
-    }
-
-    // --- Click-to-sort tables by clicking header cells (offline_gallery style) ---
-    function makeTableSortable(table){
-      if(!table) return;
-      const thead = table.querySelector("thead");
-      const tbody = table.querySelector("tbody");
-      if(!thead || !tbody) return;
-
-      const ths = Array.from(thead.querySelectorAll("th"));
-      const stateSort = { idx: -1, dir: 1 };
-
-      function cellText(tr, idx){
-        const td = tr.children[idx];
-        if(!td) return "";
-        const ds = td.getAttribute("data-sort");
-        return (ds || td.textContent || "").trim();
-      }
-
-      function cmp(a, b, idx){
-        const ha = (ths[idx]?.textContent || "").toLowerCase();
-        const av = cellText(a, idx);
-        const bv = cellText(b, idx);
-
-        if(ha.includes("price")){
-          const an = Number(av);
-          const bn = Number(bv);
-          const aok = Number.isFinite(an);
-          const bok = Number.isFinite(bn);
-          if(aok && bok) return an - bn;
-          if(aok && !bok) return -1;
-          if(!aok && bok) return 1;
-        }
-        if(ha.includes("year")){
-          const an = Number(av);
-          const bn = Number(bv);
-          const aok = Number.isFinite(an);
-          const bok = Number.isFinite(bn);
-          if(aok && bok) return an - bn;
-          if(aok && !bok) return -1;
-          if(!aok && bok) return 1;
-        }
-        return av.localeCompare(bv, undefined, { numeric:true, sensitivity:"base" });
-      }
-
-      function sortBy(idx){
-        const rows = Array.from(tbody.querySelectorAll("tr"));
-        const dir = (stateSort.idx === idx) ? -stateSort.dir : 1;
-        stateSort.idx = idx; stateSort.dir = dir;
-        rows.sort((ra, rb) => dir * cmp(ra, rb, idx));
-        rows.forEach(r => tbody.appendChild(r));
-      }
-
-      ths.forEach((th, idx) => {
-        th.style.cursor = "pointer";
-        th.title = "Click to sort";
-        th.addEventListener("click", () => sortBy(idx));
-      });
-    }
-
-    // --- Image hover preview (anchored, no modal) ---
-    function installHover(){
-      const hoverOverlay = document.createElement("div");
-      hoverOverlay.id = "imgHoverOverlay";
-      hoverOverlay.innerHTML = "<img/>";
-      document.body.appendChild(hoverOverlay);
-      const hoverImg = hoverOverlay.querySelector("img");
-      let currentImg = null;
-
-      function positionNearThumb(img){
-        const pad = 10;
-        const r = img.getBoundingClientRect();
-        const vw = window.innerWidth;
-        const vh = window.innerHeight;
-
-        const rect = hoverOverlay.getBoundingClientRect();
-        const w = rect.width || 0;
-        const h = rect.height || 0;
-
-        let x = r.right + pad;
-        let y = r.top;
-
-        if(x + w > vw) x = Math.max(pad, r.left - w - pad);
-        if(y + h > vh) y = Math.max(pad, vh - h - pad);
-        if(y < pad) y = pad;
-
-        hoverOverlay.style.left = x + "px";
-        hoverOverlay.style.top = y + "px";
-      }
-
-      function showPreview(img){
-        const full = img.getAttribute("data-full") || img.getAttribute("src") || "";
-        if(!full) return;
-        currentImg = img;
-        if(hoverImg.getAttribute("src") !== full) hoverImg.setAttribute("src", full);
-        hoverOverlay.style.display = "block";
-        positionNearThumb(img);
-      }
-
-      function hidePreview(){
-        hoverOverlay.style.display = "none";
-        hoverImg.setAttribute("src","");
-        currentImg = null;
-      }
-
-      hoverImg.addEventListener("load", ()=>{ if(currentImg) positionNearThumb(currentImg); });
-
-      document.addEventListener("mouseover", (e)=>{
-        const img = e.target.closest && e.target.closest("img.thumb");
-        if(!img) return;
-        showPreview(img);
-      });
-
-      document.addEventListener("mouseout", (e)=>{
-        const img = e.target.closest && e.target.closest("img.thumb");
-        if(!img) return;
-        hidePreview();
-      });
-
-      window.addEventListener("scroll", ()=>{ if(currentImg) positionNearThumb(currentImg); }, true);
-      window.addEventListener("resize", ()=>{ if(currentImg) positionNearThumb(currentImg); });
-    }
-
-    function render(){
-      const tbody = $("tbody");
-      tbody.innerHTML = "";
-      for(const it of state.items){
-        const rid = String(it.rid || "");
-        const priceNum = Number(it.price||0) || 0;
-        const year = it.year ? String(it.year) : "";
-        const img = it.img || "";
-        const url = "https://www.discogs.com/release/" + encodeURIComponent(rid);
-
-        const tr = document.createElement("tr");
-
-        const tdPrice = document.createElement("td");
-        tdPrice.className = "nowrap";
-        tdPrice.setAttribute("data-sort", String(priceNum));
-        tdPrice.textContent = "$" + money(priceNum);
-
-        const tdCart = document.createElement("td");
-        tdCart.className = "nowrap";
-        const wrap = document.createElement("div");
-        wrap.className = "iconstack";
-        const bMinus = document.createElement("button");
-        bMinus.className = "iconbtn";
-        bMinus.type = "button";
-        bMinus.textContent = "−";
-        bMinus.addEventListener("click", ()=>addToCart(rid, -1));
-        const qty = document.createElement("span");
-        qty.className = "qty";
-        qty.setAttribute("data-qty-for", rid);
-        qty.textContent = String(cartQty(rid));
-        const bPlus = document.createElement("button");
-        bPlus.className = "iconbtn";
-        bPlus.type = "button";
-        bPlus.textContent = "+";
-        bPlus.addEventListener("click", ()=>addToCart(rid, 1));
-        wrap.appendChild(bMinus); wrap.appendChild(qty); wrap.appendChild(bPlus);
-        tdCart.appendChild(wrap);
-
-        const tdCover = document.createElement("td");
-        tdCover.className = "nowrap";
-        const im = document.createElement("img");
-        im.className = "thumb";
-        if(img) im.src = img;
-        if(img) im.setAttribute("data-full", img);
-        im.alt = (it.artist||"") + " - " + (it.title||"");
-        tdCover.appendChild(im);
-
-        const tdArtist = document.createElement("td");
-        tdArtist.setAttribute("data-sort", (it.artist||"").trim());
-        tdArtist.textContent = (it.artist||"");
-
-        const tdTitle = document.createElement("td");
-        tdTitle.setAttribute("data-sort", (it.title||"").trim());
-        const a = document.createElement("a");
-        a.className = "dlink";
-        a.href = url;
-        a.target = "_blank";
-        a.rel = "noopener";
-        a.textContent = (it.title||"");
-        tdTitle.appendChild(a);
-
-        const tdYear = document.createElement("td");
-        tdYear.className = "nowrap";
-        tdYear.setAttribute("data-sort", year || "");
-        tdYear.textContent = year;
-
-        const tdFmt = document.createElement("td");
-        tdFmt.className = "nowrap";
-        tdFmt.setAttribute("data-sort", (it.format||"").trim());
-        tdFmt.textContent = (it.format||"");
-
-        tr.appendChild(tdPrice);
-        tr.appendChild(tdCart);
-        tr.appendChild(tdCover);
-        tr.appendChild(tdArtist);
-        tr.appendChild(tdTitle);
-        tr.appendChild(tdYear);
-        tr.appendChild(tdFmt);
-
-        tbody.appendChild(tr);
-      }
-
-      $("status").style.display = "none";
-      $("tbl").style.display = "";
-      makeTableSortable($("tbl"));
-      installHover();
-      rebuildCartText();
-    }
-
-    function boot(){
-      loadCart();
-
-      $("cartOpen").addEventListener("click", openCart);
-      $("cartClose").addEventListener("click", closeCart);
-      $("cartModal").addEventListener("click", (e)=>{ if(e.target === $("cartModal")) closeCart(); });
-      document.addEventListener("keydown", (e)=>{ if(e.key === "Escape") closeCart(); });
-
-      $("copyBtn").addEventListener("click", async ()=>{
-        try{
-          await navigator.clipboard.writeText($("cartText").value);
-          $("copyBtn").textContent = "Copied!";
-        }catch(e){
-          $("copyBtn").textContent = "Copy failed";
-        }
-        setTimeout(()=>$("copyBtn").textContent="Copy", 1200);
-      });
-
-      $("clearCartBtn").addEventListener("click", ()=>{
-        state.cart = {};
-        saveCart();
-        render();
-      });
-
-      fetch("store_inventory.json", {cache:"no-store"})
-        .then(r=>{
-          if(!r.ok) throw new Error("HTTP "+r.status);
-          return r.json();
-        })
-        .then(j=>{
-          state.items = (j && j.items) ? j.items : [];
-          $("status").textContent = "";
-          render();
-        })
-        .catch(err=>{
-          $("status").textContent = "Failed to load store_inventory.json: " + err;
-          console.error(err);
-        });
-    }
-
-    boot();
-  })();
-  </script>
-</body>
-</html>
-"""
 
 # ---- env helpers (existing var names) ----
 
@@ -635,7 +293,7 @@ def get_median(release_id: int, token: str, user_agent: str, cache: Dict[str, An
 
 # ---- Build items in legacy schema ----
 
-def build_items_from_discogs(releases: List[Dict[str, Any]], floor: float, token: str, user_agent: str, cache: Dict[str, Any], ttl_days: int) -> Tuple[List[dict], Dict[str,int]]:
+def build_items_from_discogs(releases: List[Dict[str, Any]], floor: float, token: str, user_agent: str, cache: Dict[str, Any], ttl_days: int, images_dir: Path, year_map: dict[int,str]) -> Tuple[List[dict], Dict[str,int]]:
     groups: Dict[str, dict] = {}
     by_key_rids: Dict[str, List[int]] = defaultdict(list)
 
@@ -668,18 +326,31 @@ def build_items_from_discogs(releases: List[Dict[str, Any]], floor: float, token
         artist = ""
         if isinstance(artists, list) and artists:
             artist = _norm(artists[0].get("name"))
-        year = bi.get("year")
-        try:
-            year_i = int(year) if year not in (None, "") else None
-        except Exception:
-            year_i = None
         country = _norm(bi.get("country"))
         labels = bi.get("labels") or []
         label = _norm(labels[0].get("name")) if isinstance(labels, list) and labels else ""
         catno = _norm(labels[0].get("catno")) if isinstance(labels, list) and labels else ""
-        formats = bi.get("formats") or []
-        fmt = _norm(formats[0].get("name")) if isinstance(formats, list) and formats else ""
-        img = _norm(bi.get("thumb") or bi.get("cover_image") or "")
+
+        # richer format (include 7\", 10\", 78 RPM, etc when present)
+        fmt = format_display(bi) or _norm((bi.get("formats") or [{}])[0].get("name") if isinstance(bi.get("formats"), list) and bi.get("formats") else "")
+
+        # year (prefer offline_gallery records.csv mapping when available)
+        year = (year_map.get(rid_i) or str(bi.get("year") or "")).strip() or ""
+
+        # cover image: prefer Discogs cover_image (usually higher-res than thumb)
+        cover_url = _norm(bi.get("cover_image") or bi.get("thumb") or "")
+        img_rel = ""
+        if cover_url:
+            try:
+                ext = Path(urllib.parse.urlparse(cover_url).path).suffix.lower()
+                if ext not in [".jpg", ".jpeg", ".png", ".webp"]:
+                    ext = ".jpeg"
+            except Exception:
+                ext = ".jpeg"
+            fn = _md5_16(cover_url) + ext
+            out_path = images_dir / fn
+            download_image(cover_url, out_path)
+            img_rel = f"images/{fn}"
 
         key = _make_key(artist, title)
         by_key_rids[key].append(rid_i)
@@ -689,13 +360,14 @@ def build_items_from_discogs(releases: List[Dict[str, Any]], floor: float, token
                 "key": key,
                 "artist": artist,
                 "title": title,
-                "year": year_i,
+                "year": year,
                 "country": country,
                 "label": label,
                 "catno": catno,
                 "format": fmt,
                 "rid": str(rid_i),
-                "img": img,
+                "img": img_rel or cover_url,
+                "img_full_local": img_rel, "img_full_url": cover_url or "",
                 "price": "",          # string per legacy
                 "status": "available",
                 "condition": "",
@@ -796,7 +468,6 @@ def main() -> int:
     user_agent = env("DISCOGS_USER_AGENT") or "untTool/1.0 +https://whitepup.github.io/store/"
 
     folders_str = env("DISCOGS_FOLDERS")
-    title = env("STORE_TITLE", "Record Store") or "Record Store"
     floor = float(env("STORE_MIN_PRICE", "5") or "5")
     ttl_days = int(env("STORE_CACHE_TTL_DAYS", "14") or "14")
 
@@ -819,8 +490,13 @@ def main() -> int:
     SITE_DIR = OUT_ROOT / "site"
     CACHE_PATH = OUT_ROOT / "cache.json"
     ensure_dir(SITE_DIR)
+    IMAGES_DIR = SITE_DIR / "images"
+    ensure_dir(IMAGES_DIR)
 
-    print("=== Store Builder (Legacy Layout + Discogs prices) ===", flush=True)
+    # Optional: use offline_gallery years if available
+    year_map = load_year_map(records_out / "offline_gallery" / "records.csv")
+
+    print("=== Store Data Builder (Discogs fetch + pricing + inventory json) ===", flush=True)
     print(f"DISCOGS user: {username}", flush=True)
     print(f"Folders: {len(folders)}", flush=True)
     for fn, fid in folders:
@@ -880,17 +556,12 @@ def main() -> int:
         print(f"Marketplace probe rid={probe_rid} status={st} err={er}", flush=True)
 
     cache = load_cache(CACHE_PATH)
-    items, price_stats = build_items_from_discogs(releases, floor, token, user_agent, cache, ttl_days)
+    items, price_stats = build_items_from_discogs(releases, floor, token, user_agent, cache, ttl_days, IMAGES_DIR, year_map)
     save_cache(CACHE_PATH, cache)
 
     inv_path = SITE_DIR / "store_inventory.json"
     inv_path.write_text(json.dumps({"items": items}, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Wrote: {inv_path}", flush=True)
-
-    html_path = SITE_DIR / "index.html"
-    html_out = HTML.replace("<title>Record Store</title>", f"<title>{title}</title>")
-    html_path.write_text(html_out, encoding="utf-8")
-    print(f"Site: {html_path}", flush=True)
 
     # Pricing diagnostics
     print("--- Pricing diagnostics ---", flush=True)
