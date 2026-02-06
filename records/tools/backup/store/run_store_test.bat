@@ -3,7 +3,7 @@ setlocal EnableExtensions EnableDelayedExpansion
 
 set "RECORDS_HOME=D:\records"
 set "RECORDS_OUT=D:\records\outputs"
-set "PUBLISH_REPO=C:\Users\David\Documents\GitHub\Records"
+set "PUBLISH_REPO=C:\Users\David\Documents\GitHub\store"
 
 echo === Store (TEST BUILD) ===
 echo Repo folder: %~dp0
@@ -20,7 +20,7 @@ set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 
 pushd "%~dp0"
-powershell -NoProfile -Command "py -3 -u 'store.py' 2>&1 | Tee-Object -FilePath '%LOG%'"
+powershell -NoProfile -Command "py -3 -u 'store.py' 2>&1 | Tee-Object -FilePath '%LOG%'; exit $LASTEXITCODE"
 set "EC=%ERRORLEVEL%"
 popd
 

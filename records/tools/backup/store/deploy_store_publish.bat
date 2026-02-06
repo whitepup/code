@@ -4,8 +4,10 @@ setlocal EnableExtensions
 set "RECORDS_HOME=D:\records"
 set "RECORDS_OUT=D:\records\outputs"
 
+set "PUBLISH_REPO=C:\Users\David\Documents\GitHub\store"
+
 set "SRC=%RECORDS_OUT%\store\site"
-set "DST=C:\Users\David\Documents\GitHub\store"
+set "DST=%PUBLISH_REPO%"
 
 echo === Store (DEPLOY TO PUBLISH REPO) ===
 echo Source: %SRC%

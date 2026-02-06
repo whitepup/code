@@ -1,246 +1,23 @@
 #!/usr/bin/env python3
-# BUILD_ID: 20260113_STORE_V12
+# store.py
+# Discogs collection -> store_inventory.json + legacy index.html layout (unchanged)
 
 from __future__ import annotations
 
-import csv
 import json
 import os
 import re
-import shutil
+import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+import urllib.parse
+import urllib.request
+import urllib.error
 
-from dotenv import load_dotenv
+API_BASE = "https://api.discogs.com"
 
-# Runtime roots
-RECORDS_HOME = Path(os.getenv("RECORDS_HOME", r"D:\records"))
-ENV_PATH = RECORDS_HOME / ".env"
-load_dotenv(ENV_PATH, override=True)
-
-RECORDS_OUT = Path(os.getenv("RECORDS_OUT", r"D:\records\outputs"))
-
-OFFLINE_OUT = RECORDS_OUT / "offline_gallery"
-SITE_DIR = RECORDS_OUT / "store" / "site"
-
-# Persistent (hand-edited) pricing overrides
-DATA_DIR = RECORDS_HOME / "data" / "store"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-PRICE_FILE = DATA_DIR / "pricing_overrides.csv"
-
-
-def _safe_int_year(y: str) -> Optional[int]:
-    s = (y or "").strip()
-    if not s:
-        return None
-    s = re.sub(r"\.0$", "", s)  # handle Excel 1961.0
-    if not s.isdigit():
-        return None
-    v = int(s)
-    if v < 1800 or v > 2100:
-        return None
-    return v
-
-
-def _decade(y: Optional[int]) -> str:
-    if not y:
-        return "Unknown"
-    return f"{(y // 10) * 10}s"
-
-
-def _norm(s: str) -> str:
-    return (s or "").strip()
-
-
-def _key_artist_title(artist: str, title: str) -> str:
-    def norm2(x: str) -> str:
-        x = (x or "").strip().lower()
-        x = re.sub(r"\s+", " ", x)
-        return x
-    return norm2(artist) + "||" + norm2(title)
-
-
-def _choose_year(years: List[Optional[int]]) -> Optional[int]:
-    ys = [y for y in years if isinstance(y, int)]
-    return min(ys) if ys else None
-
-
-def load_pricing_overrides(path: Path) -> Dict[str, dict]:
-    r"""
-    pricing_overrides.csv lives in D:\records\data\store\pricing_overrides.csv (persistent).
-    Keyed by normalized artist||title.
-    """
-    if not path.exists():
-        return {}
-    out: Dict[str, dict] = {}
-    with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            key = _norm(row.get("key",""))
-            if not key:
-                continue
-            out[key] = {
-                "price": _norm(row.get("price","")),
-                "status": _norm(row.get("status","")),
-                "condition": _norm(row.get("condition","")),
-                "sleeve_condition": _norm(row.get("sleeve_condition","")),
-                "notes": _norm(row.get("notes","")),
-            }
-    return out
-
-
-def discover_records_csv_files(root: Path) -> List[Path]:
-    """Return all records.csv files under offline_gallery output.
-
-    Supports both legacy layout:
-      offline_gallery/records.csv
-    and newer layouts where each tab/folder is written under a subfolder:
-      offline_gallery/<tab>/records.csv
-    """
-    files: List[Path] = []
-    root = Path(root)
-    p0 = root / "records.csv"
-    if p0.exists():
-        files.append(p0)
-    for p in root.rglob("records.csv"):
-        if p not in files:
-            files.append(p)
-    return files
-
-
-def read_records_csv_dedup(paths, pricing: Dict[str, dict]) -> List[dict]:
-    """
-    Reads one or more offline_gallery records.csv files and returns *deduped* store items grouped by Artist+Title.
-    Applies pricing overrides by key.
-    """
-    if isinstance(paths, (str, Path)):
-        paths = [Path(paths)]
-    paths = [Path(p) for p in (paths or []) if Path(p).exists()]
-    if not paths:
-        raise FileNotFoundError(f"Missing records.csv under: {OFFLINE_OUT}")
-
-    groups: Dict[str, dict] = {}
-    years_by_key: Dict[str, List[Optional[int]]] = defaultdict(list)
-    high_sold_by_key: Dict[str, List[Optional[float]]] = defaultdict(list)
-    seen_rids: set[str] = set()
-
-    for path in paths:
-        with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                folder = _norm(row.get("folder", ""))
-                # Include all "For Sale*" folders (LPs, 7\", 10\", 78s, etc.)
-                if not folder.lower().startswith("for sale"):
-                    continue
-
-                rid = _norm(row.get("release_id", ""))
-                if not rid:
-                    continue
-                if rid in seen_rids:
-                    continue
-                seen_rids.add(rid)
-
-                artist = _norm(row.get("artist", ""))
-                title = _norm(row.get("title", ""))
-                if not artist and not title:
-                    continue
-
-                key = _key_artist_title(artist, title)
-
-                year_raw = _norm(row.get("year", ""))
-                y = _safe_int_year(year_raw)
-                years_by_key[key].append(y)
-
-                # Discogs high sold value (may be absent depending on offline_gallery version)
-                high_sold = None
-                for col in (
-                    "high_sold_value",
-                    "sold_high",
-                    "high_sold",
-                    "sold_value_high",
-                    "discogs_high_sold_value",
-                    "highest_sold",
-                    "high_sold_usd",
-                ):
-                    if col in row and _norm(row.get(col, "")):
-                        try:
-                            high_sold = float(re.sub(r"[^0-9.\-]", "", _norm(row.get(col, ""))))
-                        except Exception:
-                            high_sold = None
-                        if high_sold is not None:
-                            break
-                high_sold_by_key[key].append(high_sold)
-
-                country = _norm(row.get("country", ""))
-                label = _norm(row.get("label", ""))
-                catno = _norm(row.get("catno", ""))
-                fmt = _norm(row.get("format", ""))
-                img = _norm(row.get("cover_image", "")) or _norm(row.get("image", "")) or _norm(row.get("img", ""))
-
-                # Only keep one representative row per key (dedup)
-                if key not in groups:
-                    groups[key] = {
-                        "key": key,
-                        "artist": artist,
-                        "title": title,
-                        "country": country,
-                        "label": label,
-                        "catno": catno,
-                        "format": fmt,
-                        "rid": rid,
-                        "img": img,
-                        "price": "",
-                        "status": "",
-                        "condition": "",
-                        "sleeve_condition": "",
-                        "notes": "",
-                    }
-
-    # Apply pricing overrides + defaults
-    items: List[dict] = []
-    for key, g in groups.items():
-        ov = pricing.get(key)
-        if ov:
-            if _norm(ov.get("price", "")):
-                g["price"] = _norm(ov.get("price", ""))
-            if _norm(ov.get("status", "")):
-                g["status"] = _norm(ov.get("status", ""))
-            if _norm(ov.get("condition", "")):
-                g["condition"] = _norm(ov.get("condition", ""))
-            if _norm(ov.get("sleeve_condition", "")):
-                g["sleeve_condition"] = _norm(ov.get("sleeve_condition", ""))
-            if _norm(ov.get("notes", "")):
-                g["notes"] = _norm(ov.get("notes", ""))
-
-        # If no override price: use Discogs high sold value, floor $4, round to nearest $.
-        # If no sold value available, default to $9.
-        if not _norm(str(g.get("price", ""))):
-            vals = [v for v in high_sold_by_key.get(key, []) if isinstance(v, float) and v > 0]
-            if vals:
-                p = int(round(max(vals)))
-                if p < 4:
-                    p = 4
-                g["price"] = str(p)
-            else:
-                g["price"] = "9"
-
-        chosen = _choose_year(years_by_key.get(key, []))
-        if chosen is not None:
-            g["year"] = str(chosen)
-            g["decade"] = _decade(chosen)
-        else:
-            g["decade"] = "Unknown"
-
-        if g.get("img"):
-            g["img"] = g["img"].lstrip("/\\")
-
-        items.append(g)
-
-    items.sort(key=lambda x: ((x.get("artist") or "").lower(), (x.get("title") or "").lower()))
-    return items
-
-
+# ---- legacy HTML layout (restored) ----
 HTML = """<!doctype html>
 <html lang="en">
 <head>
@@ -551,6 +328,8 @@ function updateCartButton(){
       img.src = it.img || "";
       img.alt = `${it.artist || ""} — ${it.title || ""}`.trim();
       img.onerror = ()=>{ img.style.visibility="hidden"; };
+      img.style.cursor = "pointer";
+      img.addEventListener("click", ()=>{ if(it.rid){ window.open(`https://www.discogs.com/release/${it.rid}`, "_blank"); } });
 
       // Title + artist stacked vertically to the right
       const meta = document.createElement("div");
@@ -733,50 +512,449 @@ $("q").addEventListener("input", ()=>applyFilters());
 </html>
 """
 
+# ---- env helpers (existing var names) ----
+
+def env(name: str, default: Optional[str] = None) -> Optional[str]:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return default
+    return v
+
+def ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+def _norm(s: Any) -> str:
+    if s is None:
+        return ""
+    return str(s).strip()
+
+def _norm_key(s: str) -> str:
+    s = _norm(s).lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def _make_key(artist: str, title: str) -> str:
+    # Stable grouping key
+    return f"{_norm_key(artist)}|{_norm_key(title)}"
+
+# ---- .env loader for local runs (store.bat also loads; this is fallback) ----
+def load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            v = v.strip()
+            if k and k not in os.environ:
+                os.environ[k] = v
+    except Exception:
+        return
+
+# ---- Discogs HTTP ----
+
+def http_get_json(url: str, token: str, user_agent: str, sleep_s: float = 0.85) -> Tuple[Optional[Dict[str, Any]], Optional[int], Optional[str]]:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": user_agent,
+            "Authorization": f"Discogs token={token}",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            status = getattr(resp, "status", 200)
+            body = resp.read().decode("utf-8", errors="replace")
+        time.sleep(sleep_s)
+        return json.loads(body), status, None
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        time.sleep(sleep_s)
+        return None, int(getattr(e, "code", 0) or 0), (body[:500] if body else str(e))
+    except Exception as e:
+        time.sleep(sleep_s)
+        return None, None, str(e)
+
+
+def cached_http_get_json(url: str, token: str, user_agent: str, cache: Dict[str, Any], ttl_days: int, sleep_s: float = 0.0) -> Tuple[Optional[Dict[str, Any]], Optional[int], Optional[str]]:
+    """Cache wrapper around http_get_json. Cache key is the full URL."""
+    ent = cache.get(url) if isinstance(cache, dict) else None
+    if isinstance(ent, dict):
+        ts = ent.get("ts")
+        if ts is not None and ttl_days is not None:
+            try:
+                if (time.time() - float(ts)) <= float(ttl_days) * 86400.0:
+                    return ent.get("json"), ent.get("status"), ent.get("err")
+            except Exception:
+                pass
+    j, status, err = cached_http_get_json(url, token, user_agent, cache, ttl_days, sleep_s=sleep_s)
+    if isinstance(cache, dict):
+        cache[url] = {"ts": time.time(), "status": status, "err": err, "json": j}
+    return j, status, err
+def paged_releases(url: str, token: str, user_agent: str, per_page: int = 100) -> Tuple[List[Dict[str, Any]], Dict[str,int]]:
+    out: List[Dict[str, Any]] = []
+    page = 1
+    stats = {"pages":0, "http_errors":0}
+    while True:
+        join = "&" if "?" in url else "?"
+        u = f"{url}{join}per_page={per_page}&page={page}"
+        data, status, err = http_get_json(u, token, user_agent)
+        if data is None:
+            stats["http_errors"] += 1
+            break
+        items = data.get("releases") or []
+        if not items:
+            break
+        out.extend(items)
+        stats["pages"] += 1
+        pagination = data.get("pagination") or {}
+        pages = pagination.get("pages")
+        if pages is not None and page >= int(pages):
+            break
+        if pages is None and len(items) < per_page:
+            break
+        page += 1
+    return out, stats
+
+def parse_discogs_folders(s: str) -> List[Tuple[str, int]]:
+    # "Personal:9057173,For Sale:9057166,Inbox:9061693"
+    out: List[Tuple[str, int]] = []
+    for part in [p.strip() for p in (s or "").split(",") if p.strip()]:
+        if ":" not in part:
+            continue
+        name, fid = part.split(":", 1)
+        name = name.strip()
+        fid = fid.strip()
+        try:
+            out.append((name, int(fid)))
+        except Exception:
+            continue
+    return out
+
+def pick_folder(folders: List[Tuple[str,int]]) -> Tuple[str,int]:
+    forced_id = env("STORE_FOLDER_ID")
+    if forced_id:
+        try:
+            fid = int(forced_id)
+            for n,i in folders:
+                if i == fid:
+                    return n,i
+            return str(fid), fid
+        except Exception:
+            pass
+
+    preferred = env("STORE_FOLDER_NAME")
+    if preferred:
+        for n,i in folders:
+            if n.lower() == preferred.lower():
+                return n,i
+
+    for n,i in folders:
+        if n.lower() == "for sale":
+            return n,i
+
+    return folders[0]
+
+# ---- Marketplace median ----
+
+def load_cache(path: Path) -> Dict[str, Any]:
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+def save_cache(path: Path, cache: Dict[str, Any]) -> None:
+    path.write_text(json.dumps(cache, indent=2, sort_keys=True), encoding="utf-8")
+
+def get_median(release_id: int, token: str, user_agent: str, cache: Dict[str, Any], ttl_days: int, sleep_s: float = 0.95) -> Tuple[Optional[float], Optional[int], Optional[str]]:
+    key = str(release_id)
+    now = int(time.time())
+    cached = cache.get(key)
+    if isinstance(cached, dict):
+        ts = int(cached.get("ts", 0) or 0)
+        # Cache schema compatibility: only trust entries that include a median field.
+        has_median = ("median" in cached) or ("median_usd" in cached)
+        if ts and has_median and (now - ts) < ttl_days * 86400:
+            # Support old key name median_usd from earlier scripts
+            med = cached.get("median") if ("median" in cached) else cached.get("median_usd")
+            return med, cached.get("status"), cached.get("err")
+
+    url = f"{API_BASE}/marketplace/stats/{release_id}"
+    data, status, err = cached_http_get_json(url, token, user_agent, cache, ttl_days, sleep_s=sleep_s)
+    median_f: Optional[float] = None
+    if data and isinstance(data, dict):
+        m = data.get("median")
+        if isinstance(m, dict):
+            v = m.get("value")
+            try:
+                median_f = float(v) if v not in (None, "") else None
+            except Exception:
+                median_f = None
+
+    cache[key] = {"ts": now, "median": median_f, "median_usd": median_f, "status": status, "err": err}
+    return median_f, status, err
+
+# ---- Build items in legacy schema ----
+
+def build_items_from_discogs(releases: List[Dict[str, Any]], floor: float, token: str, user_agent: str, cache: Dict[str, Any], ttl_days: int) -> Tuple[List[dict], Dict[str,int]]:
+    groups: Dict[str, dict] = {}
+    by_key_rids: Dict[str, List[int]] = defaultdict(list)
+
+    stats = {
+        "rows": 0,
+        "groups": 0,
+        "median_ok": 0,
+        "median_missing": 0,
+        "median_errors": 0,
+        "http_401": 0,
+        "http_403": 0,
+        "http_404": 0,
+        "http_429": 0,
+        "http_other": 0,
+    }
+
+    for r in releases:
+        stats["rows"] += 1
+        bi = r.get("basic_information") or {}
+        rid = bi.get("id")
+        if rid is None:
+            continue
+        try:
+            rid_i = int(rid)
+        except Exception:
+            continue
+
+        title = _norm(bi.get("title"))
+        artists = bi.get("artists") or []
+        artist = ""
+        if isinstance(artists, list) and artists:
+            artist = _norm(artists[0].get("name"))
+        year = bi.get("year")
+        try:
+            year_i = int(year) if year not in (None, "") else None
+        except Exception:
+            year_i = None
+        country = _norm(bi.get("country"))
+        labels = bi.get("labels") or []
+        label = _norm(labels[0].get("name")) if isinstance(labels, list) and labels else ""
+        catno = _norm(labels[0].get("catno")) if isinstance(labels, list) and labels else ""
+        formats = bi.get("formats") or []
+        fmt = _norm(formats[0].get("name")) if isinstance(formats, list) and formats else ""
+        img = _norm(bi.get("thumb") or bi.get("cover_image") or "")
+
+        key = _make_key(artist, title)
+        by_key_rids[key].append(rid_i)
+
+        if key not in groups:
+            groups[key] = {
+                "key": key,
+                "artist": artist,
+                "title": title,
+                "country": country,
+                "label": label,
+                "catno": catno,
+                "format": fmt,
+                "rid": str(rid_i),
+                "img": img,
+                "price": "",          # string per legacy
+                "status": "available",
+                "condition": "",
+                "sleeve_condition": "",
+                "notes": "",
+            }
+
+    # price each group using the first rid for that group
+    for idx, (key, g) in enumerate(groups.items(), start=1):
+        rid_i = int(g.get("rid") or 0)
+        if idx == 1 or idx % 100 == 0:
+            print(f"Pricing {idx}/{len(groups)} ...", flush=True)
+        # Prefer Discogs price suggestions by condition (default VG)
+        suggested = None
+        sugg_url = f"{API_BASE}/marketplace/price_suggestions/{rid_i}"
+        sugg_json, sugg_status, sugg_err = cached_http_get_json(sugg_url, token, user_agent, cache, ttl_days, sleep_s=0.95)
+        if isinstance(sugg_json, dict):
+            ps = sugg_json.get("price_suggestions")
+            if ps is None:
+                ps = sugg_json
+            priority = ("Very Good (VG)", "Very Good Plus (VG+)", "Near Mint (NM or M-)", "Mint (M)")
+            if isinstance(ps, dict):
+                for cond in priority:
+                    ent = ps.get(cond)
+                    if isinstance(ent, dict):
+                        v = ent.get("value")
+                    else:
+                        v = ent
+                    try:
+                        suggested = float(v) if v not in (None, "") else None
+                    except Exception:
+                        suggested = None
+                    if suggested is not None:
+                        break
+            elif isinstance(ps, list):
+                for cond in priority:
+                    for row in ps:
+                        if isinstance(row, dict) and row.get("condition") == cond:
+                            v = row.get("value")
+                            try:
+                                suggested = float(v) if v not in (None, "") else None
+                            except Exception:
+                                suggested = None
+                            break
+                    if suggested is not None:
+                        break
+        
+        if suggested is not None:
+            if float(suggested) < floor:
+                stats["median_missing"] += 1
+                price = floor
+            else:
+                stats["median_ok"] += 1
+                price = float(suggested)
+        else:
+            median, status, err = get_median(rid_i, token, user_agent, cache, ttl_days)
+            if status == 401:
+                stats["http_401"] += 1
+            elif status == 403:
+                stats["http_403"] += 1
+            elif status == 404:
+                stats["http_404"] += 1
+            elif status == 429:
+                stats["http_429"] += 1
+            elif isinstance(status, int) and status >= 400:
+                stats["http_other"] += 1
+        
+            if median is None:
+                if status is None or (isinstance(status, int) and status >= 400):
+                    stats["median_errors"] += 1
+                else:
+                    stats["median_missing"] += 1
+                price = floor
+            else:
+                if float(median) < floor:
+                    stats["median_missing"] += 1
+                    price = floor
+                else:
+                    stats["median_ok"] += 1
+                    price = float(median)
+        g["price"] = str(int(round(price)))
+
+    items = list(groups.values())
+    items.sort(key=lambda x: ((x.get("artist") or "").lower(), (x.get("title") or "").lower()))
+    stats["groups"] = len(items)
+    return items, stats
+
+# ---- Main ----
 
 def main() -> int:
-    print("=== Store Builder ===", flush=True)
-    print(f"Offline gallery: {OFFLINE_OUT}", flush=True)
-    print(f"Site output: {SITE_DIR}", flush=True)
-    print(f"Pricing overrides: {PRICE_FILE}", flush=True)
+    # Allow running store.py directly without store.bat
+    load_env_file(Path(r"D:\records\.env"))
 
-    SITE_DIR.mkdir(parents=True, exist_ok=True)
-    (SITE_DIR / "images").mkdir(parents=True, exist_ok=True)
+    records_home = Path(env("RECORDS_HOME", r"D:\records"))
+    records_out = Path(env("RECORDS_OUT", str(records_home / "outputs")))
+    token = env("DISCOGS_TOKEN")
+    username = env("DISCOGS_USERNAME") or env("DISCOGS_USER")
+    user_agent = env("DISCOGS_USER_AGENT") or "untTool/1.0 +https://whitepup.github.io/store/"
 
-    records_csv_files = discover_records_csv_files(OFFLINE_OUT)
-    pricing = load_pricing_overrides(PRICE_FILE)
-    items = read_records_csv_dedup(records_csv_files, pricing)
+    folders_str = env("DISCOGS_FOLDERS")
+    title = env("STORE_TITLE", "Record Store") or "Record Store"
+    floor = float(env("STORE_MIN_PRICE", "5") or "5")
+    ttl_days = int(env("STORE_CACHE_TTL_DAYS", "14") or "14")
+
+    if not token:
+        print("ERROR: DISCOGS_TOKEN missing.", flush=True)
+        return 2
+    if not username:
+        print("ERROR: DISCOGS_USERNAME/DISCOGS_USER missing.", flush=True)
+        return 3
+    if not folders_str:
+        print("ERROR: DISCOGS_FOLDERS missing.", flush=True)
+        return 4
+
+    folders = parse_discogs_folders(folders_str)
+    if not folders:
+        print("ERROR: Could not parse DISCOGS_FOLDERS.", flush=True)
+        return 5
+
+    folder_name, folder_id = pick_folder(folders)
+
+    OUT_ROOT = records_out / "store"
+    SITE_DIR = OUT_ROOT / "site"
+    CACHE_PATH = OUT_ROOT / "cache.json"
+    ensure_dir(SITE_DIR)
+
+    print("=== Store Builder (Legacy Layout + Discogs prices) ===", flush=True)
+    print(f"DISCOGS user: {username}", flush=True)
+    print(f"Folder: {folder_name} ({folder_id})", flush=True)
+    print(f"Floor: ${int(floor)}", flush=True)
+    print(f"Output site: {SITE_DIR}", flush=True)
+    print(f"Cache: {CACHE_PATH}", flush=True)
+
+    releases_url = f"{API_BASE}/users/{urllib.parse.quote(username)}/collection/folders/{folder_id}/releases"
+    releases, rel_stats = paged_releases(releases_url, token, user_agent, per_page=100)
+    print(f"Collection API pages: {rel_stats.get('pages',0)} | releases rows: {len(releases)} | http_errors: {rel_stats.get('http_errors',0)}", flush=True)
+    # Quick live probe: attempt marketplace stats for first release_id to capture raw failure mode
+    probe_rid = None
+    for rr in releases:
+        bi = rr.get("basic_information") or {}
+        rid = bi.get("id")
+        if rid is not None:
+            try:
+                probe_rid = int(rid)
+                break
+            except Exception:
+                pass
+    if probe_rid:
+        probe_url = f"{API_BASE}/marketplace/stats/{probe_rid}"
+        d, st, er = http_get_json(probe_url, token, user_agent, sleep_s=0.0)
+        print(f"Marketplace probe rid={probe_rid} status={st} err={er}", flush=True)
+
+    cache = load_cache(CACHE_PATH)
+    items, price_stats = build_items_from_discogs(releases, floor, token, user_agent, cache, ttl_days)
+    save_cache(CACHE_PATH, cache)
 
     inv_path = SITE_DIR / "store_inventory.json"
     inv_path.write_text(json.dumps({"items": items}, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Wrote: {inv_path}", flush=True)
 
-    # Copy images referenced by items to site/images and rewrite img to relative paths
-    src_images = OFFLINE_OUT / "images"
-    dst_images = SITE_DIR / "images"
-    copied = 0
-    for it in items:
-        rel = (it.get("img") or "").strip()
-        if not rel:
-            continue
-        name = rel.split("/")[-1].split("\\")[-1]
-        src = src_images / name
-        dst = dst_images / name
-        if src.exists():
-            shutil.copy2(src, dst)
-            copied += 1
-            it["img"] = f"images/{name}"
-
-    # Rewrite inventory after img normalization
-    inv_path.write_text(json.dumps({"items": items}, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"Images ready: {dst_images} (copied {copied})", flush=True)
-
     html_path = SITE_DIR / "index.html"
-    html_path.write_text(HTML, encoding="utf-8", newline="\n")
+    html_out = HTML.replace("<title>Record Store</title>", f"<title>{title}</title>")
+    html_out = html_out.replace(">Record Store<", f">{title}<")
+    html_path.write_text(html_out, encoding="utf-8")
     print(f"Site: {html_path}", flush=True)
+
+    # Pricing diagnostics
+    print("--- Pricing diagnostics ---", flush=True)
+    # Always show up to 5 sample errors from marketplace stats calls
+    if price_stats.get("median_errors", 0) > 0:
+        samples = []
+        for rid, v in cache.items():
+            if isinstance(v, dict):
+                err = v.get("err")
+                status = v.get("status")
+                if err:
+                    samples.append((rid, status, err))
+        if samples:
+            print("sample_marketplace_errors:", flush=True)
+            for rid, status, err in samples[:5]:
+                print(f"  rid={rid} status={status} err={err}", flush=True)
+        else:
+            print("sample_marketplace_errors: (none recorded in cache)", flush=True)
+    for k in ["groups","median_ok","median_missing","median_errors","http_401","http_403","http_404","http_429","http_other"]:
+        print(f"{k}: {price_stats.get(k,0)}", flush=True)
+    if price_stats.get("http_429",0) > 0:
+        print("NOTE: HTTP 429 indicates rate limiting; rerun later or increase cache TTL.", flush=True)
+
     print("Done.", flush=True)
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
